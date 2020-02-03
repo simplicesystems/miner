@@ -81,6 +81,8 @@ exec_dist_test(_, Config, VarMap) ->
             ?assert(check_atleast_k_receipts(Miners, length(Miners) + 1)),
             %% Now we can check whether we have path growth
             ?assert(check_eventual_path_growth(Miners)),
+            %% Finally we check whether witnesses refreshed for any hotspots
+            ?assert(miner_witness_monitor:check_witness_refresh()),
             %% Now we check whether the scores have grown
             FinalScores = gateway_scores(Config),
             ct:pal("FinalScores: ~p", [FinalScores]),
@@ -100,6 +102,8 @@ setup_dist_test(TestCase, Config, VarMap) ->
     {_, Locations} = lists:unzip(initialize_chain(Miners, TestCase, Config, VarMap)),
     GenesisBlock = get_genesis_block(Miners, Config),
     miner_fake_radio_backplane:start_link(45000, lists:zip(lists:seq(46001, 46000 + MinerCount), Locations)),
+    %% Doesn't matter which miner we want to monitor, since we only care about what's in the ledger
+    miner_witness_monitor:start_link(hd(Miners)),
     timer:sleep(5000),
     true = load_genesis_block(GenesisBlock, Miners, Config),
     %% wait till height 50
@@ -306,11 +310,13 @@ check_eventual_path_growth(Miners) ->
             ct:pal("ReceiptCounter: ~p", [receipt_counter(ReceiptMap)]),
             %% wait 50 more blocks?
             Height = get_current_height(Miners),
+            ok = miner_witness_monitor:save_witnesses(Height),
             true = wait_until_height(Miners, Height + 50),
             check_eventual_path_growth(Miners);
         true ->
             ct:pal("Every poc eventually grows in path length!"),
             ct:pal("ReceiptCounter: ~p", [receipt_counter(ReceiptMap)]),
+            ok = miner_witness_monitor:save_witnesses(get_current_height(Miners)),
             true
     end.
 
@@ -403,19 +409,22 @@ check_atleast_k_receipts(Miners, K) ->
                                 0,
                                 maps:values(ReceiptMap)),
     ct:pal("TotalReceipts: ~p", [TotalReceipts]),
+    CurHeight = get_current_height(Miners),
     case TotalReceipts >= K of
         false ->
             %% wait more
             ct:pal("Don't have receipts from each miner yet..."),
             ct:pal("ReceiptCounter: ~p", [receipt_counter(ReceiptMap)]),
-            case get_current_height(Miners) + 10 of
+            case CurHeight + 10 of
                 N when N > 200 ->
                     false;
                 N ->
+                    ok = miner_witness_monitor:save_witnesses(CurHeight),
                     true = wait_until_height(Miners, N),
                     check_atleast_k_receipts(Miners, K)
             end;
         true ->
+            ok = miner_witness_monitor:save_witnesses(CurHeight),
             true
     end.
 
@@ -479,4 +488,4 @@ common_poc_vars(Config) ->
       ?poc_v4_target_score_curve => 5,
       ?poc_target_hex_parent_res => 5,
       ?poc_v5_target_prob_randomness_wt => 0.0,
-      ?witness_refresh_interval => 11}.
+      ?witness_refresh_interval => 30}.
