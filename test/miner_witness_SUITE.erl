@@ -52,14 +52,14 @@ run_dist_with_params(TestCase, Config, VarMap) ->
     %% Execute the test
     ok = exec_dist_test(TestCase, Config, VarMap),
     %% show the final receipt counter
-    Miners = proplists:get_value(miners, Config),
+    Miners = ?config(miners, Config),
     FinalReceiptMap = challenger_receipts_map(find_receipts(Miners)),
     ct:pal("FinalReceiptCounter: ~p", [receipt_counter(FinalReceiptMap)]),
     %% The test endeth here
     ok.
 
 exec_dist_test(_, Config, VarMap) ->
-    Miners = proplists:get_value(miners, Config),
+    Miners = ?config(miners, Config),
     %% Print scores before we begin the test
     InitialScores = gateway_scores(Config),
     ct:pal("InitialScores: ~p", [InitialScores]),
@@ -97,15 +97,22 @@ exec_dist_test(_, Config, VarMap) ->
     ok.
 
 setup_dist_test(TestCase, Config, VarMap) ->
-    Miners = proplists:get_value(miners, Config),
+    Miners = ?config(miners, Config),
     MinerCount = length(Miners),
     {_, Locations} = lists:unzip(initialize_chain(Miners, TestCase, Config, VarMap)),
-    GenesisBlock = get_genesis_block(Miners, Config),
+    _GenesisBlock = get_genesis_block(Miners, Config),
     miner_fake_radio_backplane:start_link(45000, lists:zip(lists:seq(46001, 46000 + MinerCount), Locations)),
     %% Doesn't matter which miner we want to monitor, since we only care about what's in the ledger
     miner_witness_monitor:start_link(hd(Miners)),
     timer:sleep(5000),
-    true = load_genesis_block(GenesisBlock, Miners, Config),
+    %% Get non consensus miners
+    NonConsensusMiners = miner_ct_utils:non_consensus_miners(Miners),
+    %% Get consensus miners
+    ConsensusMiners = miner_ct_utils:in_consensus_miners(Miners),
+    %% ensure that blockchain is undefined for non_consensus miners
+    false = miner_ct_utils:blockchain_worker_check(NonConsensusMiners),
+    %% integrate genesis block
+    _GenesisLoadResults = miner_ct_utils:integrate_genesis_block(hd(ConsensusMiners), NonConsensusMiners),
     %% wait till height 50
     true = wait_until_height(Miners, 50),
     ok.
@@ -128,9 +135,9 @@ gen_locations(_TestCase, Addresses, VarMap) ->
     {Locs, Locs}.
 
 initialize_chain(Miners, TestCase, Config, VarMap) ->
-    Addresses = proplists:get_value(addresses, Config),
-    N = proplists:get_value(num_consensus_members, Config),
-    Curve = proplists:get_value(dkg_curve, Config),
+    Addresses = ?config(addresses, Config),
+    N = ?config(num_consensus_members, Config),
+    Curve = ?config(dkg_curve, Config),
     Keys = libp2p_crypto:generate_keys(ecc_compact),
     InitialVars = miner_ct_utils:make_vars(Keys, VarMap),
     InitialPaymentTransactions = [blockchain_txn_coinbase_v1:new(Addr, 5000) || Addr <- Addresses],
@@ -150,7 +157,7 @@ initialize_chain(Miners, TestCase, Config, VarMap) ->
     AddressesWithClaimedLocations.
 
 get_genesis_block(Miners, Config) ->
-    RPCTimeout = proplists:get_value(rpc_timeout, Config),
+    RPCTimeout = ?config(rpc_timeout, Config),
     ct:pal("RPCTimeout: ~p", [RPCTimeout]),
     %% obtain the genesis block
     GenesisBlock = get_genesis_block_(Miners, RPCTimeout),
@@ -168,28 +175,6 @@ get_genesis_block_([Miner|Miners], RPCTimeout) ->
             {ok, GBlock} = rpc:call(Miner, blockchain, genesis_block, [Chain], RPCTimeout),
             GBlock
     end.
-
-
-load_genesis_block(GenesisBlock, Miners, Config) ->
-    RPCTimeout = proplists:get_value(rpc_timeout, Config),
-    %% load the genesis block on all the nodes
-    lists:foreach(
-        fun(Miner) ->
-                case ct_rpc:call(Miner, miner_consensus_mgr, in_consensus, [], RPCTimeout) of
-                    true ->
-                        ok;
-                    false ->
-                        Res = ct_rpc:call(Miner, blockchain_worker,
-                                          integrate_genesis_block, [GenesisBlock], RPCTimeout),
-                        ct:pal("loading genesis ~p block on ~p ~p", [GenesisBlock, Miner, Res])
-                end
-        end,
-        Miners
-    ),
-
-    timer:sleep(5000),
-
-    true = wait_until_height(Miners, 1).
 
 wait_until_height(Miners, Height) ->
     miner_ct_utils:wait_until(
@@ -287,19 +272,13 @@ check_all_miners_can_challenge(Miners) ->
         false ->
             ct:pal("Not every miner has issued a challenge...waiting..."),
             %% wait 50 more blocks?
-            NewHeight = get_current_height(Miners),
+            NewHeight = miner_ct_utils:height(hd(Miners)),
             true = wait_until_height(Miners, NewHeight + 50),
             check_all_miners_can_challenge(Miners);
         true ->
             ct:pal("Got a challenge from each miner atleast once!"),
             true
     end.
-
-get_current_height(Miners) ->
-    [M | _] = Miners,
-    Chain = ct_rpc:call(M, blockchain_worker, blockchain, []),
-    {ok, Height} = ct_rpc:call(M, blockchain, height, [Chain]),
-    Height.
 
 check_eventual_path_growth(Miners) ->
     ReceiptMap = challenger_receipts_map(find_receipts(Miners)),
@@ -309,14 +288,14 @@ check_eventual_path_growth(Miners) ->
             ct:pal("RequestCounter: ~p", [request_counter(find_requests(Miners))]),
             ct:pal("ReceiptCounter: ~p", [receipt_counter(ReceiptMap)]),
             %% wait 50 more blocks?
-            Height = get_current_height(Miners),
+            Height = miner_ct_utils:height(hd(Miners)),
             ok = miner_witness_monitor:save_witnesses(Height),
             true = wait_until_height(Miners, Height + 50),
             check_eventual_path_growth(Miners);
         true ->
             ct:pal("Every poc eventually grows in path length!"),
             ct:pal("ReceiptCounter: ~p", [receipt_counter(ReceiptMap)]),
-            ok = miner_witness_monitor:save_witnesses(get_current_height(Miners)),
+            ok = miner_witness_monitor:save_witnesses(miner_ct_utils:height(hd(Miners))),
             true
     end.
 
@@ -390,7 +369,7 @@ check_multiple_requests(Miners) ->
             %% wait more
             ct:pal("Don't have multiple requests yet..."),
             ct:pal("RequestCounter: ~p", [RequestCounter]),
-            case get_current_height(Miners) + 10 of
+            case miner_ct_utils:height(hd(Miners)) + 10 of
                 N when N > 200 ->
                     false;
                 N ->
@@ -409,7 +388,7 @@ check_atleast_k_receipts(Miners, K) ->
                                 0,
                                 maps:values(ReceiptMap)),
     ct:pal("TotalReceipts: ~p", [TotalReceipts]),
-    CurHeight = get_current_height(Miners),
+    CurHeight = miner_ct_utils:height(hd(Miners)),
     case TotalReceipts >= K of
         false ->
             %% wait more
@@ -446,8 +425,8 @@ active_gateways([Miner | _]=_Miners) ->
     ct_rpc:call(Miner, blockchain_ledger_v1, active_gateways, [Ledger]).
 
 gateway_scores(Config) ->
-    [Miner | _] = proplists:get_value(miners, Config),
-    Addresses = proplists:get_value(addresses, Config),
+    [Miner | _] = ?config(miners, Config),
+    Addresses = ?config(addresses, Config),
     Chain = ct_rpc:call(Miner, blockchain_worker, blockchain, []),
     Ledger = ct_rpc:call(Miner, blockchain, ledger, [Chain]),
     lists:foldl(fun(Address, Acc) ->
@@ -459,11 +438,11 @@ gateway_scores(Config) ->
                 Addresses).
 
 common_poc_vars(Config) ->
-    N = proplists:get_value(num_consensus_members, Config),
-    BlockTime = proplists:get_value(block_time, Config),
-    Interval = proplists:get_value(election_interval, Config),
-    BatchSize = proplists:get_value(batch_size, Config),
-    Curve = proplists:get_value(dkg_curve, Config),
+    N = ?config(num_consensus_members, Config),
+    BlockTime = ?config(block_time, Config),
+    Interval = ?config(election_interval, Config),
+    BatchSize = ?config(batch_size, Config),
+    Curve = ?config(dkg_curve, Config),
     %% Don't put the poc version here
     %% Add it to the map in the tests above
     #{?block_time => BlockTime,
