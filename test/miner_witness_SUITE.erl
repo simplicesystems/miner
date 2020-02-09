@@ -31,7 +31,7 @@ all() ->
     [refresh_test].
 
 init_per_testcase(TestCase, Config0) ->
-    Config = miner_ct_utils:init_per_testcase(TestCase, Config0),
+    Config = miner_ct_utils:init_per_testcase(miner_witness_suite, TestCase, Config0),
     Config.
 
 end_per_testcase(TestCase, Config) ->
@@ -101,7 +101,7 @@ setup_dist_test(TestCase, Config, VarMap) ->
     MinerCount = length(Miners),
     {_, Locations} = lists:unzip(initialize_chain(Miners, TestCase, Config, VarMap)),
     _GenesisBlock = get_genesis_block(Miners, Config),
-    miner_fake_radio_backplane:start_link(45000, lists:zip(lists:seq(46001, 46000 + MinerCount), Locations)),
+    miner_fake_radio_backplane:start_link(TestCase, 45000, lists:zip(lists:seq(46001, 46000 + MinerCount), Locations)),
     %% Doesn't matter which miner we want to monitor, since we only care about what's in the ledger
     miner_witness_monitor:start_link(hd(Miners)),
     timer:sleep(5000),
