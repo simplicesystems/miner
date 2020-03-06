@@ -374,8 +374,8 @@ handle_call(consensus_group, _From, State) ->
 handle_call({start_chain, ConsensusGroup, Chain}, _From, State) ->
     lager:info("registering first consensus group"),
     {reply, ok, set_next_block_timer(State#state{consensus_group = ConsensusGroup,
-                                           blockchain = Chain})};
-handle_call({create_block, Stamps, Txns, HBBFTRound}, _From, State) ->
+                                                 blockchain = Chain})};
+handle_call({create_block, Stamps0, Txns, HBBFTRound}, _From, State) ->
     %% This can actually be a stale message, in which case we'd produce a block with a garbage timestamp
     %% This is not actually that big of a deal, since it won't be accepted, but we can short circuit some effort
     %% by checking for a stale hash
@@ -383,10 +383,20 @@ handle_call({create_block, Stamps, Txns, HBBFTRound}, _From, State) ->
     {ok, CurrentBlock} = blockchain:head_block(Chain),
     {ok, CurrentBlockHash} = blockchain:head_hash(Chain),
     {ElectionEpoch0, EpochStart0} = blockchain_block_v1:election_info(CurrentBlock),
-    lager:info("stamps ~p, current hash ~p", [Stamps, CurrentBlockHash]),
+    lager:info("stamps ~p, current hash ~p", [Stamps0, CurrentBlockHash]),
     %% we expect every stamp to contain the same block hash
+    Stamps = lists:foldl(fun({_, {_, Stamp}}, Acc) -> % old tuple vsn
+                                 [Stamp | Acc];
+                            ({_, #{stamp := Stamp}}, Acc) -> % new map vsn
+                                 [Stamp | Acc];
+                            (_, Acc) ->
+                                 %% maybe crash here?
+                                 Acc
+                         end,
+                         [],
+                         Stamps0),
     Reply =
-        case lists:usort([ X || {_, {_, X}} <- Stamps ]) of
+        case lists:usort(Stamps) of
             [CurrentBlockHash] ->
                 SortedTransactions = lists:sort(fun blockchain_txn:sort/2, Txns),
                 CurrentBlockHeight = blockchain_block:height(CurrentBlock),

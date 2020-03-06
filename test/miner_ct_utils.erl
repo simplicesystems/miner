@@ -728,7 +728,7 @@ make_vars(Keys, Map, Mode) ->
               ?block_time => 2,
               ?election_interval => 30,
               ?election_restart_interval => 10,
-              ?num_consensus_members => 7,
+              ?num_consensus_members => 4,
               ?batch_size => 2500,
               ?vars_commit_delay => 5,
               ?var_gw_inactivity_threshold => 20,

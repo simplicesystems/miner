@@ -1,5 +1,5 @@
 %%%-------------------------------------------------------------------
-%% @doc
+%% @Dec
 %% == miner hbbft_handler ==
 %% @end
 %%%-------------------------------------------------------------------
@@ -7,7 +7,12 @@
 
 -behavior(relcast).
 
--export([init/1, handle_message/3, handle_command/2, callback_message/3, serialize/1, deserialize/1, restore/2, stamp/1]).
+-export([
+         init/1,
+         handle_message/3, handle_command/2, callback_message/3,
+         serialize/1, deserialize/1, restore/2,
+         metadata/2
+        ]).
 
 -record(state,
         {
@@ -24,19 +29,23 @@
          artifact :: undefined | binary(),
          members :: [libp2p_crypto:pubkey_bin()],
          chain :: undefined | blockchain:blockchain(),
-         signed = 0 :: non_neg_integer()
+         signed = 0 :: non_neg_integer(),
+         seen = #{} :: #{non_neg_integer() => boolean()}
         }).
 
-stamp(Chain) ->
+metadata(Meta, Chain) ->
     {ok, HeadHash} = blockchain:head_hash(Chain),
     %% construct a 2-tuple of the system time and the current head block hash as our stamp data
-    term_to_binary({erlang:system_time(seconds), HeadHash}).
+    ChainMeta = #{timestamp => erlang:system_time(seconds), head_hash => HeadHash},
+    term_to_binary(maps:merge(Meta, ChainMeta)).
 
 init([Members, Id, N, F, BatchSize, SK, Chain]) ->
     init([Members, Id, N, F, BatchSize, SK, Chain, 0, []]);
 init([Members, Id, N, F, BatchSize, SK, Chain, Round, Buf]) ->
+    %% if we're first starting up, we don't know anything about the
+    %% metadata.
     HBBFT = hbbft:init(SK, N, F, Id-1, BatchSize, 1500,
-                       {?MODULE, stamp, [Chain]}, Round, Buf),
+                       {?MODULE, metadata, [#{}, Chain]}, Round, Buf),
     Ledger = blockchain_ledger_v1:new_context(blockchain:ledger(Chain)),
     Chain1 = blockchain:ledger(Ledger, Chain),
 
@@ -88,7 +97,9 @@ handle_command({status, Ref, Worker}, State) ->
                                }, maps:remove(sig_sent, Map))},
     {reply, ok, ignore};
 handle_command({skip, Ref, Worker}, State) ->
-    case hbbft:next_round(State#state.hbbft) of
+    Chain = blockchain_worker:blockchain(),
+    HBBFT = hbbft:set_stamp_fun(?MODULE, metadata, [#{}, Chain], State#state.hbbft),
+    case hbbft:next_round(HBBFT) of
         {NextHBBFT, ok} ->
             Worker ! {Ref, ok},
             {reply, ok, [new_epoch], State#state{hbbft=NextHBBFT, signatures=[], artifact=undefined, sig_phase=unsent}};
@@ -116,13 +127,18 @@ handle_command({next_round, NextRound, TxnsToRemove, _Sync}, State=#state{hbbft=
                         Buf1 = miner_hbbft_sidecar:new_round(Buf, BinTxnsToRemove),
                         hbbft:buf(Buf1, HBBFT)
                 end,
-            case hbbft:next_round(HBBFT1, NextRound, []) of
+            Chain = blockchain_worker:blockchain(),
+            %% TODO: add bba datas
+            HBBFT2 = hbbft:set_stamp_fun(?MODULE, metadata, [#{seen => State#state.seen}, Chain], HBBFT1),
+            case hbbft:next_round(HBBFT2, NextRound, []) of
                 {NextHBBFT, ok} ->
                     {reply, ok, [ new_epoch ], State#state{hbbft=NextHBBFT, signatures=[],
-                                                           artifact=undefined, sig_phase=unsent}};
+                                                           artifact=undefined, sig_phase=unsent,
+                                                           seen = #{}}};
                 {NextHBBFT, {send, NextMsgs}} ->
                     {reply, ok, [ new_epoch ] ++ fixup_msgs(NextMsgs),
-                     State#state{hbbft=NextHBBFT, signatures=[], artifact=undefined, sig_phase=unsent}}
+                     State#state{hbbft=NextHBBFT, signatures=[], artifact=undefined, sig_phase=unsent,
+                                 seen = #{}}}
             end;
         0 ->
             lager:warning("Already at the current Round: ~p", [NextRound]),
@@ -201,18 +217,20 @@ handle_message(BinMsg, Index, State=#state{hbbft = HBBFT}) ->
                     ignore
             end;
         _ ->
+            Seen = (State#state.seen)#{Index => true},
             case hbbft:handle_msg(HBBFT, Index - 1, Msg) of
                 ignore -> ignore;
                 {NewHBBFT, ok} ->
                     %lager:debug("HBBFT Status: ~p", [hbbft:status(NewHBBFT)]),
-                    {State#state{hbbft=NewHBBFT}, []};
+                    {State#state{hbbft=NewHBBFT, seen = Seen}, []};
                 {_, defer} ->
                     defer;
                 {NewHBBFT, {send, Msgs}} ->
                     %lager:debug("HBBFT Status: ~p", [hbbft:status(NewHBBFT)]),
-                    {State#state{hbbft=NewHBBFT}, fixup_msgs(Msgs)};
-                {NewHBBFT, {result, {transactions, Stamps0, BinTxns}}} ->
-                    Stamps = [{Id, binary_to_term(S)} || {Id, S} <- Stamps0],
+                    {State#state{hbbft=NewHBBFT, seen = Seen}, fixup_msgs(Msgs)};
+                {NewHBBFT, {result, {transactions, Metadata, BinTxns}}} ->
+                    %% TODO handle both forms here
+                    Stamps = get_stamps(Metadata),
                     Txns = [blockchain_txn:deserialize(B) || B <- BinTxns],
                     lager:info("Reached consensus ~p ~p", [Index, Round]),
                     %% lager:info("stamps ~p~n", [Stamps]),
@@ -222,7 +240,7 @@ handle_message(BinMsg, Index, State=#state{hbbft = HBBFT}) ->
                     %% transactions depending on its buffer
                     NewRound = hbbft:round(NewHBBFT),
                     Before = erlang:monotonic_time(millisecond),
-                    case miner:create_block(Stamps, Txns, NewRound) of
+                    case miner:create_block(Stamps, Txns, NewRound, Seen) of
                         {ok, Address, Artifact, Signature, TxnsToRemove} ->
                             %% call hbbft finalize round
                             Duration = erlang:monotonic_time(millisecond) - Before,
@@ -234,7 +252,8 @@ handle_message(BinMsg, Index, State=#state{hbbft = HBBFT}) ->
                             NewerHBBFT1 = hbbft:buf(Buf1, NewerHBBFT),
                             put(filtered, NewRound),
                             Msgs = [{multicast, {signature, NewRound, Address, Signature}}],
-                            {filter_signatures(State#state{hbbft=NewerHBBFT1, sig_phase=sig, artifact=Artifact}), fixup_msgs(Msgs)};
+                            {filter_signatures(State#state{hbbft=NewerHBBFT1, sig_phase=sig,
+                                                           seen = Seen, artifact=Artifact}), fixup_msgs(Msgs)};
                         {error, Reason} ->
                             %% this is almost certainly because we got the new block gossipped before we completed consensus locally
                             %% which is harmless
@@ -245,6 +264,18 @@ handle_message(BinMsg, Index, State=#state{hbbft = HBBFT}) ->
     end.
 
 callback_message(_, _, _) -> none.
+
+get_stamps(Stamps0) ->
+    Stamps = [{Id, binary_to_term(S)} || {Id, S} <- Stamps0],
+    %% the fun here is intentionally non-exhaustive for now.  Not sure
+    %% how do deal with non-conforming stamps yet.
+    lists:foldl(fun({_, {_, Stamp}}, Acc) -> % old tuple vsn
+                        [Stamp | Acc];
+                   ({_, #{stamp := Stamp}}, Acc) -> % new map vsn
+                        [Stamp | Acc]
+                end,
+                [],
+                Stamps).
 
 serialize(State) ->
     {SerializedHBBFT, SerializedSK} = hbbft:serialize(State#state.hbbft, true),
