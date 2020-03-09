@@ -89,7 +89,7 @@ handle_command({status, Ref, Worker}, State) ->
                    end,
     Sigs = map_ids(State#state.signatures, State#state.members),
     Worker ! {Ref, maps:merge(#{signatures_required =>
-                                    State#state.signatures_required - length(Sigs),
+                                    max(State#state.signatures_required - length(Sigs), 0),
                                 signatures => Sigs,
                                 sig_phase => State#state.sig_phase,
                                 artifact_hash => ArtifactHash,
@@ -129,7 +129,18 @@ handle_command({next_round, NextRound, TxnsToRemove, _Sync}, State=#state{hbbft=
                 end,
             Chain = blockchain_worker:blockchain(),
             %% TODO: add bba datas
-            HBBFT2 = hbbft:set_stamp_fun(?MODULE, metadata, [#{seen => State#state.seen}, Chain], HBBFT1),
+            #{acs := ACS} = hbbft:status(HBBFT),
+            #{bba := BBA1} = ACS,
+            BBA0 = maps:map(fun(_ID, #{bba := #{state := done}}) ->
+                                    true;
+                               (_, _) ->
+                                    false
+                            end, BBA1),
+            BBA = blockchain_utils:map_to_bitvector(BBA0),
+            Seen = blockchain_utils:map_to_bitvector(State#state.seen),
+            HBBFT2 = hbbft:set_stamp_fun(?MODULE, metadata, [#{seen => Seen,
+                                                               bba_completion => BBA},
+                                                             Chain], HBBFT1),
             case hbbft:next_round(HBBFT2, NextRound, []) of
                 {NextHBBFT, ok} ->
                     {reply, ok, [ new_epoch ], State#state{hbbft=NextHBBFT, signatures=[],
@@ -228,9 +239,9 @@ handle_message(BinMsg, Index, State=#state{hbbft = HBBFT}) ->
                 {NewHBBFT, {send, Msgs}} ->
                     %lager:debug("HBBFT Status: ~p", [hbbft:status(NewHBBFT)]),
                     {State#state{hbbft=NewHBBFT, seen = Seen}, fixup_msgs(Msgs)};
-                {NewHBBFT, {result, {transactions, Metadata, BinTxns}}} ->
-                    %% TODO handle both forms here
-                    Stamps = get_stamps(Metadata),
+                {NewHBBFT, {result, {transactions, Metadata0, BinTxns}}} ->
+                    %% Stamps = get_stamps(Metadata),
+                    Metadata = lists:map(fun({Id, BMap}) -> {Id, binary_to_term(BMap)} end, Metadata0),
                     Txns = [blockchain_txn:deserialize(B) || B <- BinTxns],
                     lager:info("Reached consensus ~p ~p", [Index, Round]),
                     %% lager:info("stamps ~p~n", [Stamps]),
@@ -240,7 +251,7 @@ handle_message(BinMsg, Index, State=#state{hbbft = HBBFT}) ->
                     %% transactions depending on its buffer
                     NewRound = hbbft:round(NewHBBFT),
                     Before = erlang:monotonic_time(millisecond),
-                    case miner:create_block(Stamps, Txns, NewRound, Seen) of
+                    case miner:create_block(Metadata, Txns, NewRound) of
                         {ok, Address, Artifact, Signature, TxnsToRemove} ->
                             %% call hbbft finalize round
                             Duration = erlang:monotonic_time(millisecond) - Before,
@@ -265,17 +276,17 @@ handle_message(BinMsg, Index, State=#state{hbbft = HBBFT}) ->
 
 callback_message(_, _, _) -> none.
 
-get_stamps(Stamps0) ->
-    Stamps = [{Id, binary_to_term(S)} || {Id, S} <- Stamps0],
-    %% the fun here is intentionally non-exhaustive for now.  Not sure
-    %% how do deal with non-conforming stamps yet.
-    lists:foldl(fun({_, {_, Stamp}}, Acc) -> % old tuple vsn
-                        [Stamp | Acc];
-                   ({_, #{stamp := Stamp}}, Acc) -> % new map vsn
-                        [Stamp | Acc]
-                end,
-                [],
-                Stamps).
+%% get_stamps(Stamps0) ->
+%%     Stamps = [{Id, binary_to_term(S)} || {Id, S} <- Stamps0],
+%%     %% the fun here is intentionally non-exhaustive for now.  Not sure
+%%     %% how do deal with non-conforming stamps yet.
+%%     lists:foldl(fun({_, {_, Stamp}}, Acc) -> % old tuple vsn
+%%                         [Stamp | Acc];
+%%                    ({_, #{timestamp := Stamp}}, Acc) -> % new map vsn
+%%                         [Stamp | Acc]
+%%                 end,
+%%                 [],
+%%                 Stamps).
 
 serialize(State) ->
     {SerializedHBBFT, SerializedSK} = hbbft:serialize(State#state.hbbft, true),
