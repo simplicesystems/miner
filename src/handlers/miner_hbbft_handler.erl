@@ -30,7 +30,8 @@
          members :: [libp2p_crypto:pubkey_bin()],
          chain :: undefined | blockchain:blockchain(),
          signed = 0 :: non_neg_integer(),
-         seen = #{} :: #{non_neg_integer() => boolean()}
+         seen = #{} :: #{non_neg_integer() => boolean()},
+         bba = <<>> :: binary()
         }).
 
 metadata(Meta, Chain) ->
@@ -128,28 +129,19 @@ handle_command({next_round, NextRound, TxnsToRemove, _Sync}, State=#state{hbbft=
                         hbbft:buf(Buf1, HBBFT)
                 end,
             Chain = blockchain_worker:blockchain(),
-            %% TODO: add bba datas
-            #{acs := ACS} = hbbft:status(HBBFT),
-            #{bba := BBA1} = ACS,
-            BBA0 = maps:map(fun(_ID, #{bba := #{state := done}}) ->
-                                    true;
-                               (_, _) ->
-                                    false
-                            end, BBA1),
-            BBA = blockchain_utils:map_to_bitvector(BBA0),
             Seen = blockchain_utils:map_to_bitvector(State#state.seen),
             HBBFT2 = hbbft:set_stamp_fun(?MODULE, metadata, [#{seen => Seen,
-                                                               bba_completion => BBA},
+                                                               bba_completion => State#state.bba},
                                                              Chain], HBBFT1),
             case hbbft:next_round(HBBFT2, NextRound, []) of
                 {NextHBBFT, ok} ->
                     {reply, ok, [ new_epoch ], State#state{hbbft=NextHBBFT, signatures=[],
                                                            artifact=undefined, sig_phase=unsent,
-                                                           seen = #{}}};
+                                                           bba = <<>>, seen = #{}}};
                 {NextHBBFT, {send, NextMsgs}} ->
                     {reply, ok, [ new_epoch ] ++ fixup_msgs(NextMsgs),
                      State#state{hbbft=NextHBBFT, signatures=[], artifact=undefined, sig_phase=unsent,
-                                 seen = #{}}}
+                                 bba = <<>>, seen = #{}}}
             end;
         0 ->
             lager:warning("Already at the current Round: ~p", [NextRound]),
@@ -240,7 +232,6 @@ handle_message(BinMsg, Index, State=#state{hbbft = HBBFT}) ->
                     %lager:debug("HBBFT Status: ~p", [hbbft:status(NewHBBFT)]),
                     {State#state{hbbft=NewHBBFT, seen = Seen}, fixup_msgs(Msgs)};
                 {NewHBBFT, {result, {transactions, Metadata0, BinTxns}}} ->
-                    %% Stamps = get_stamps(Metadata),
                     Metadata = lists:map(fun({Id, BMap}) -> {Id, binary_to_term(BMap)} end, Metadata0),
                     Txns = [blockchain_txn:deserialize(B) || B <- BinTxns],
                     lager:info("Reached consensus ~p ~p", [Index, Round]),
@@ -263,8 +254,9 @@ handle_message(BinMsg, Index, State=#state{hbbft = HBBFT}) ->
                             NewerHBBFT1 = hbbft:buf(Buf1, NewerHBBFT),
                             put(filtered, NewRound),
                             Msgs = [{multicast, {signature, NewRound, Address, Signature}}],
-                            {filter_signatures(State#state{hbbft=NewerHBBFT1, sig_phase=sig,
-                                                           seen = Seen, artifact=Artifact}), fixup_msgs(Msgs)};
+                            BBA = make_bba(State#state.n, Metadata),
+                            {filter_signatures(State#state{hbbft = NewerHBBFT1, sig_phase = sig, bba = BBA,
+                                                           seen = Seen, artifact = Artifact}), fixup_msgs(Msgs)};
                         {error, Reason} ->
                             %% this is almost certainly because we got the new block gossipped before we completed consensus locally
                             %% which is harmless
@@ -276,17 +268,17 @@ handle_message(BinMsg, Index, State=#state{hbbft = HBBFT}) ->
 
 callback_message(_, _, _) -> none.
 
-%% get_stamps(Stamps0) ->
-%%     Stamps = [{Id, binary_to_term(S)} || {Id, S} <- Stamps0],
-%%     %% the fun here is intentionally non-exhaustive for now.  Not sure
-%%     %% how do deal with non-conforming stamps yet.
-%%     lists:foldl(fun({_, {_, Stamp}}, Acc) -> % old tuple vsn
-%%                         [Stamp | Acc];
-%%                    ({_, #{timestamp := Stamp}}, Acc) -> % new map vsn
-%%                         [Stamp | Acc]
-%%                 end,
-%%                 [],
-%%                 Stamps).
+make_bba(Sz, Metadata) ->
+    M = maps:from_list([{Id, true} || {Id, _} <- Metadata]),
+    M1 = lists:foldl(fun(Id, Acc) ->
+                             case Acc of
+                                 #{Id := _} ->
+                                     Acc;
+                                 _ ->
+                                     Acc#{Id => false}
+                             end
+                     end, M, lists:seq(1, Sz)),
+    blockchain_utils:map_to_bitvector(M1).
 
 serialize(State) ->
     {SerializedHBBFT, SerializedSK} = hbbft:serialize(State#state.hbbft, true),

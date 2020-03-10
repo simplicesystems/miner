@@ -243,7 +243,7 @@ relcast_queue(Group) ->
 %% @doc
 %% @end
 %%--------------------------------------------------------------------
--spec create_block(Metadata :: [#{},...],
+-spec create_block(Metadata :: [{pos_integer(), #{}},...],
                    Txns :: blockchain_txn:txns(),
                    HBBFTRound :: non_neg_integer())
                   -> {ok,
