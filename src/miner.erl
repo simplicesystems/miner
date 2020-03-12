@@ -397,8 +397,8 @@ handle_call({create_block, Metadata, Txns, HBBFTRound}, _From, State) ->
                     [],
                     Metadata),
     SeenBBAs =
-        lists:foldl(fun({_, #{seen := Seen, bba_completion := B}}, Acc) -> % new map vsn
-                            [{Seen, B} | Acc];
+        lists:foldl(fun({Idx, #{seen := Seen, bba_completion := B}}, Acc) -> % new map vsn
+                            [{{Idx, Seen}, B} | Acc];
                        (_, Acc) ->
                             %% maybe crash here?
                             Acc
