@@ -39,6 +39,7 @@ metadata(Meta, Chain) ->
     %% construct a 2-tuple of the system time and the current head block hash as our stamp data
     ChainMeta = #{timestamp => erlang:system_time(seconds), head_hash => HeadHash},
     term_to_binary(maps:merge(Meta, ChainMeta)).
+    %%term_to_binary({erlang:system_time(seconds), HeadHash}).
 
 init([Members, Id, N, F, BatchSize, SK, Chain]) ->
     init([Members, Id, N, F, BatchSize, SK, Chain, 0, []]);
@@ -308,6 +309,7 @@ deserialize(#{sk := SKSer,
     SK = tpke_privkey:deserialize(binary_to_term(SKSer)),
     HBBFT = hbbft:deserialize(HBBFTSer, SK),
     Fields = record_info(fields, state),
+    Bundef = term_to_binary(undefined, [compressed]),
     DeserList =
         lists:map(
           fun(hbbft) ->
@@ -318,15 +320,15 @@ deserialize(#{sk := SKSer,
                   undefined;
              (K)->
                   case StateMap of
-                      #{K := V} ->
-                          case V of
-                              undefined ->
-                                  undefined;
-                              _ ->
-                                  binary_to_term(V)
-                          end;
+                      #{K := V} when V /= undefined andalso
+                                     V /= Bundef ->
+                          binary_to_term(V);
                       _ when K == sig_phase ->
                           sig;
+                      _ when K == seen ->
+                          #{};
+                      _ when K == bba ->
+                          <<>>;
                       _ ->
                           undefined
                   end
