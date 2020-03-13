@@ -219,9 +219,14 @@ packets_expiry_test(Config) ->
     %% At this point, we're certain that sc is open
     %% Use client node to send some packets
     Packet1 = blockchain_helium_packet_v1:new(OUI, <<"p1">>),
+    PacketInfo1 = {Packet1, <<"devaddr">>, 1, <<"mic1">>},
     Packet2 = blockchain_helium_packet_v1:new(OUI, <<"p2">>),
-    ok = ct_rpc:call(ClientNode, blockchain_state_channels_client, packet, [Packet1]),
-    ok = ct_rpc:call(ClientNode, blockchain_state_channels_client, packet, [Packet2]),
+    PacketInfo2 = {Packet2, <<"devaddr">>, 2, <<"mic2">>},
+    ok = ct_rpc:call(ClientNode, blockchain_state_channels_client, packet, [PacketInfo1]),
+    ok = ct_rpc:call(ClientNode, blockchain_state_channels_client, packet, [PacketInfo2]),
+
+    Deets1 = ct_rpc:call(ClientNode, blockchain_state_channels_client, packet_details, []),
+    ct:pal("Deets1: ~p", [Deets1]),
 
     %% wait ExpireWithin + 3 more blocks to be safe
     ok = miner_ct_utils:wait_for_gte(height, Miners, Height + ExpireWithin + 3),
@@ -306,13 +311,17 @@ multi_clients_packets_expiry_test(Config) ->
     %% At this point, we're certain that sc is open
     %% Use client nodes to send some packets
     Packet1 = blockchain_helium_packet_v1:new(OUI, <<"p1">>),
+    PacketInfo1 = {Packet1, <<"devaddr1">>, 1, <<"mic1">>},
     Packet2 = blockchain_helium_packet_v1:new(OUI, <<"p2">>),
+    PacketInfo2 = {Packet2, <<"devaddr1">>, 2, <<"mic2">>},
     Packet3 = blockchain_helium_packet_v1:new(OUI, <<"p3">>),
+    PacketInfo3 = {Packet3, <<"devaddr2">>, 1, <<"mic3">>},
     Packet4 = blockchain_helium_packet_v1:new(OUI, <<"p4">>),
-    ok = ct_rpc:call(ClientNode1, blockchain_state_channels_client, packet, [Packet1]),
-    ok = ct_rpc:call(ClientNode1, blockchain_state_channels_client, packet, [Packet2]),
-    ok = ct_rpc:call(ClientNode2, blockchain_state_channels_client, packet, [Packet3]),
-    ok = ct_rpc:call(ClientNode2, blockchain_state_channels_client, packet, [Packet4]),
+    PacketInfo4 = {Packet4, <<"devaddr2">>, 2, <<"mic4">>},
+    ok = ct_rpc:call(ClientNode1, blockchain_state_channels_client, packet, [PacketInfo1]),
+    ok = ct_rpc:call(ClientNode1, blockchain_state_channels_client, packet, [PacketInfo2]),
+    ok = ct_rpc:call(ClientNode2, blockchain_state_channels_client, packet, [PacketInfo3]),
+    ok = ct_rpc:call(ClientNode2, blockchain_state_channels_client, packet, [PacketInfo4]),
 
     %% check state_channel appears on the ledger
     {ok, SC} = get_ledger_state_channel(RouterNode, ID, RouterPubkeyBin),
@@ -411,9 +420,20 @@ not_enough_dc_test(Config) ->
 
     %% At this point, we're certain that sc is open
     %% 1DC = 24 byte packet, the client node sends `TotalDC` such packets
-    Packets = [blockchain_helium_packet_v1:new(OUI, crypto:strong_rand_bytes(24)) || _ <- lists:seq(1, TotalDC)],
+    Packets = lists:map(fun(I) ->
+                                {blockchain_helium_packet_v1:new(OUI, crypto:strong_rand_bytes(24)),
+                                 <<"devaddr">>,
+                                 I,
+                                 <<"mic", I>>
+                                }
+                        end,
+                        lists:seq(1, TotalDC)),
+
+    ct:pal("Packets: ~p", [Packets]),
+
     %% And then tries to send another one. Expectation is that this one doesn't make it.
-    ExtraPacket = blockchain_helium_packet_v1:new(OUI, <<"notenoughcredits">>),
+    ExtraPacket = {blockchain_helium_packet_v1:new(OUI, <<"notenoughcredits">>),
+                   <<"devaddr">>, 1, <<"mic">>},
 
     ok = lists:foreach(fun(Packet) ->
                                ok = ct_rpc:call(ClientNode, blockchain_state_channels_client, packet, [Packet])
